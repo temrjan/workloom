@@ -1,0 +1,215 @@
+"""HR Documents API — render DOCX templates + download + history."""
+
+import logging
+import secrets
+from pathlib import Path
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel, Field
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from workloom.core.database import get_session
+from workloom.core.dependencies import RequireHREmailDep
+from workloom.modules.hr.documents.docx_generator import text_to_docx
+from workloom.modules.hr.documents.renderer import render_template
+from workloom.modules.hr.library import service as library_service
+from workloom.modules.hr.library.models import HRDocument, HRTemplate
+from workloom.modules.hr.library.schemas import DocumentListResponse, DocumentResponse
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/hr/documents", tags=["hr-documents"])
+
+SessionDep = Annotated[AsyncSession, Depends(get_session)]
+
+
+class DocxRequest(BaseModel):
+    """Request body for text-to-DOCX generation."""
+
+    text: str = Field(..., description="Document text to convert to DOCX")
+    filename: str = Field("document.docx", description="Output filename")
+
+
+class RenderRequest(BaseModel):
+    """Request body for template rendering."""
+
+    template_id: int = Field(..., description="Template ID from library")
+    data: dict[str, str] = Field(
+        ..., description="Placeholder values: {FIO: '...', POSITION: '...'}"
+    )
+    filename: str = Field("document.docx", description="Output filename")
+
+
+@router.post("/download-docx")
+async def download_docx(
+    current_user: RequireHREmailDep,
+    req: DocxRequest,
+) -> StreamingResponse:
+    """Convert text to DOCX and return as download."""
+    _ = current_user
+    buffer = text_to_docx(req.text)
+    filename = (
+        req.filename if req.filename.endswith(".docx") else req.filename + ".docx"
+    )
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/render")
+async def render_docx(
+    current_user: RequireHREmailDep,
+    db: SessionDep,
+    req: RenderRequest,
+) -> StreamingResponse:
+    """Render a DOCX template with provided data and return as download."""
+    _ = current_user
+
+    # Get template from DB
+    template = await library_service.get_template(db, req.template_id)
+    if not template:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Template not found"
+        )
+
+    if not template.name.endswith(".docx"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only DOCX templates can be rendered. Upload a .docx file with {{ PLACEHOLDERS }}.",
+        )
+
+    result = await db.execute(
+        select(HRTemplate).where(HRTemplate.id == req.template_id)
+    )
+    db_template = result.scalar_one_or_none()
+    if not db_template:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Template not found"
+        )
+
+    # Render template — sanitize errors: log full traceback, expose only correlation id
+    try:
+        buffer = render_template(db_template.file_path, req.data)
+    except Exception as e:
+        correlation_id = secrets.token_hex(8)
+        logger.exception(
+            "Failed to render template %d (cid=%s)",
+            req.template_id,
+            correlation_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Render failed. Reference: {correlation_id}",
+        ) from e
+
+    filename = (
+        req.filename if req.filename.endswith(".docx") else req.filename + ".docx"
+    )
+
+    logger.info(
+        "Rendered template_id=%d fields=%d",
+        req.template_id,
+        len(req.data),
+    )
+
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/download/{file_id}")
+async def download_rendered(
+    file_id: str,
+    current_user: RequireHREmailDep,
+    db: SessionDep,
+) -> FileResponse:
+    """Download a rendered DOCX by file ID.
+
+    Returns 404 if the file_id does not correspond to an HRDocument record
+    (closes IDOR: file paths on disk are not directly addressable).
+    """
+    _ = current_user
+
+    result = await db.execute(select(HRDocument).where(HRDocument.file_id == file_id))
+    doc = result.scalar_one_or_none()
+    if doc is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="File not found or expired"
+        )
+
+    file_path = Path(doc.file_path)
+    if not file_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="File not found or expired"
+        )
+    return FileResponse(
+        path=str(file_path),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename=f"document_{file_id}.docx",
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Document History
+# ═══════════════════════════════════════════════════════════════════
+
+
+@router.get("", response_model=DocumentListResponse)
+async def list_documents(
+    current_user: RequireHREmailDep,
+    db: SessionDep,
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=100),
+) -> DocumentListResponse:
+    """List generated documents with pagination (newest first)."""
+    _ = current_user
+
+    offset = (page - 1) * per_page
+
+    count_result = await db.execute(select(func.count(HRDocument.id)))
+    total = count_result.scalar_one()
+
+    result = await db.execute(
+        select(HRDocument)
+        .order_by(HRDocument.created_at.desc())
+        .offset(offset)
+        .limit(per_page)
+    )
+    items = [DocumentResponse.model_validate(row) for row in result.scalars().all()]
+
+    return DocumentListResponse(items=items, total=total, page=page, per_page=per_page)
+
+
+@router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_document(
+    document_id: int,
+    current_user: RequireHREmailDep,
+    db: SessionDep,
+) -> None:
+    """Delete a generated document (file + DB record)."""
+    _ = current_user
+
+    result = await db.execute(select(HRDocument).where(HRDocument.id == document_id))
+    doc = result.scalar_one_or_none()
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Document not found"
+        )
+
+    # Delete file from disk
+    try:
+        Path(doc.file_path).unlink(missing_ok=True)
+        logger.info("Deleted file: %s", doc.file_path)
+    except OSError:
+        logger.warning("Could not delete file: %s", doc.file_path)
+
+    # Delete DB record
+    await db.delete(doc)
+    logger.info("Deleted document id=%d file_id=%s", doc.id, doc.file_id)
